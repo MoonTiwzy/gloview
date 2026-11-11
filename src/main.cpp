@@ -234,6 +234,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:switch_on_new_workspace", Config::INTEGER{1}); // clicking "+" follows the display to the new workspace
     addColor("plugin:gloview:close_button_color", Config::INTEGER{0xe6e23b3bLL}); // desktop-mode "✕" close button fill
 
+    // no_screen_share: honor Hyprland noscreenshare on overview *preview tiles* in share
+    // (per-tile black). Dual-view via ScreenshareFrame::renderMonitor when free, or via
+    // noshare-cover extra-rect API (Path C). Old cover without API → Option B while sharing.
+    // Default 1.
+    addInt("plugin:gloview:no_screen_share", Config::INTEGER{1});
+    // Prefer noshare-cover coexistence: Path C (extra-rect API) or Path B (Option B) when
+    // cover is loaded — skip fighting for ScreenshareFrame::renderMonitor. Set 0 to always
+    // attempt Path A even if cover is detected. Default 1.
+    addInt("plugin:gloview:noshare_cover_compat", Config::INTEGER{1});
+
     // --- bar / layer-shell hiding (waybar, quickshell-based bars, …) ---
     addInt("plugin:gloview:hide_top_layers", Config::INTEGER{0});     // fade out Top layer surfaces (bars) while the overview is up
     addInt("plugin:gloview:hide_overlay_layers", Config::INTEGER{0}); // fade out Overlay layer surfaces (popups/notifications)

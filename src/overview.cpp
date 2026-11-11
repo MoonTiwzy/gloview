@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <dlfcn.h>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -18,6 +20,7 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
 #include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/layout/target/WindowTarget.hpp>
 #include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
@@ -40,11 +43,14 @@
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
+#include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <hyprland/src/workspace/RegularWorkspace.hpp>
 #include <hyprland/src/input/Keys.hpp>
+
+#include "noshare_cover_compat.hpp" // Path A/B/C vs noshare-cover renderMonitor
 
 using Render::GL::g_pHyprOpenGL;
 
@@ -282,6 +288,17 @@ void fixFractionalScaleUV(const SP<CWLSurfaceResource>& surface, const PHLMONITO
         uvMax -= misalignment / bufferSize;
 }
 
+// Forward decls — used by renderWindowLive Option B before the full noscreenshare block.
+// CScreenshareFrame::render / ::renderMonitor (void(Render::CRenderContext&)): thisptr first.
+using PRENDERSS = void (*)(void*, Render::CRenderContext&);
+PRENDERSS g_screenshareExportOrig = nullptr;
+// True when share blackout is handled off the local overview pass (dual-view):
+// Path A (we own renderMonitor) or Path C (noshare-cover extra-rect API).
+// When false and cover owns the trampoline without API → Option B while sharing.
+bool g_exportDualView = false;
+bool windowNoScreenShare(const PHLWINDOW& w);
+bool honorNoScreenShare();
+
 // Render a window's LIVE surface tree scaled into `destPx`, clipped to `clipPx`
 // (both monitor PIXEL coords) via real CSurfacePassElements. No crop rect to drift,
 // so immune to snapshots' stale/mis-cropped tiles; works on hidden workspaces.
@@ -291,6 +308,23 @@ void renderWindowLive(Render::CRenderContext& ctx, const PHLWINDOW& w, const PHL
         return;
     if (!(destPx.w > 0 && destPx.h > 0))
         return;
+
+    // Option B (fallback when noshare-cover is loaded but has no extra-rect API): when
+    // g_exportDualView=false and this output is being screenshared, bake solid black into
+    // the overview pass for noscreenshare tiles. Mirror capture carries black to Discord.
+    // Local also sees black for those tiles while sharing — honest tradeoff. With dual-view
+    // (Path A own renderMonitor, or Path C cover extra-rect API) keep live tiles here.
+    if (honorNoScreenShare() && windowNoScreenShare(w) && !g_exportDualView && Screenshare::mgr() && Screenshare::mgr()->isOutputBeingSSd(mon)) {
+        const double roundPx = roundSlotPx > 0.0 ? roundSlotPx * mon->m_scale : 0.0;
+        Render::IHyprRenderer::addPassElement(ctx, makeUnique<CRectPassElement>(CRectPassElement::SRectData{
+                                                       .box           = destPx,
+                                                       .color         = CHyprColor{0.F, 0.F, 0.F, std::clamp(alpha, 0.F, 1.F)},
+                                                       .round         = static_cast<int>(roundPx),
+                                                       .roundingPower = w->presentation().roundingPower(),
+                                                       .clipBox       = clipPx,
+                                                   }));
+        return;
+    }
 
     // When reported size > committed buffer (CWLSurface::small(): X11 size hints/mid-resize),
     // getTexBox CENTERS it at real size, leaving an uncovered margin. m_fillIgnoreSmall
@@ -438,6 +472,41 @@ bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
     return g_shouldRenderWindowOrig ? g_shouldRenderWindowOrig(thisptr, window) : true;
 }
 
+// plugin:gloview:no_screen_share — honor Hyprland noscreenshare on overview *tiles* in the
+// screencopy export only. Hyprland blacks noscreenshare windows at their real boxes in
+// Screenshare::CScreenshareFrame::renderMonitor AFTER the mirror blit. Overview relocates
+// those surfaces into preview tiles, so we black ONLY those tile boxes on the same export
+// path. Local swapchain / interactive overview keeps live previews. Do NOT full-buffer
+// black, mirror FB clear, bindTempFB/glClear, or RENDER_POST EGL.
+bool windowNoScreenShare(const PHLWINDOW& w) {
+    return w && w->m_ruleApplicator && w->m_ruleApplicator->noScreenShare().valueOrDefault();
+}
+
+bool honorNoScreenShare() {
+    const auto it = g_config.ints.find("plugin:gloview:no_screen_share");
+    if (it == g_config.ints.end() || !it->second)
+        return true;
+    return static_cast<int>(it->second->value()) != 0;
+}
+
+bool shouldHonorNoScreenShareExport(const Render::CRenderContext& ctx) {
+    if (!g_overview || !g_overview->active() || !honorNoScreenShare())
+        return false;
+    const auto mon = ctx.m_data.pMonitor.lock();
+    return mon && mon == g_overview->monitor();
+}
+
+// Runs on the screencopy export path (after mirror blit + Hyprland noscreenshare
+// blackouts), already inside beginRender(RENDER_MODE_TO_BUFFER / FULL_FAKE).
+// Installed on CScreenshareFrame::renderMonitor when free; else on ::render() so we
+// still run after another plugin's renderMonitor hook (noshare-cover, etc.).
+void hkScreenshareExport(void* thisptr, Render::CRenderContext& ctx) {
+    if (g_screenshareExportOrig)
+        g_screenshareExportOrig(thisptr, ctx);
+    if (shouldHonorNoScreenShareExport(ctx))
+        g_overview->blackoutNoScreenShareExportTiles(ctx);
+}
+
 CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
     const auto a = static_cast<double>((raw >> 24) & 0xFF) / 255.0;
     const auto r = static_cast<double>((raw >> 16) & 0xFF) / 255.0;
@@ -553,6 +622,13 @@ Overview::~Overview() {
     // inactive overview and no dangling refs.
     m_active  = false;
     m_opening = false;
+    m_configReloadL.reset();
+    if (m_coverResyncTimer && g_pEventLoopManager) {
+        m_coverResyncTimer->cancel();
+        g_pEventLoopManager->removeTimer(m_coverResyncTimer);
+        m_coverResyncTimer.reset();
+    }
+    noshare_cover::unbind(); // clear extra rects, unregister, drop any handle
     PreviewFilter::reset();
     restoreLayers(); // never leave a bar stuck at alpha 0 if we're torn down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
@@ -579,8 +655,14 @@ Overview::~Overview() {
         HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderWindowHook);
         m_shouldRenderWindowHook = nullptr;
     }
+    if (m_renderMonitorHook) {
+        HyprlandAPI::removeFunctionHook(m_handle, m_renderMonitorHook);
+        m_renderMonitorHook = nullptr;
+    }
     g_shouldRenderOrig       = nullptr;
     g_shouldRenderWindowOrig = nullptr;
+    g_screenshareExportOrig  = nullptr;
+    g_exportDualView         = false;
 }
 
 bool Overview::initialize() {
@@ -653,7 +735,317 @@ bool Overview::initialize() {
         return false;
     }
     g_shouldRenderWindowOrig = reinterpret_cast<PSHOULDRENDERWINDOW>(m_shouldRenderWindowHook->m_original);
+
+    setupScreenshareExport();
+
+    // Re-pick the share path whenever the plugin set may have changed: Hyprland reloads the
+    // config after every plugin load/unload. This is what makes load order irrelevant.
+    m_configReloadL = events.config.reloaded.listen([this] { resyncScreenshareExport(); });
+
     return true;
+}
+
+// Pick how noscreenshare preview tiles are handled in screen captures (Path A/B/C, see
+// noshare_cover_compat.hpp). Safe to call again at any time: tears the previous choice down.
+void Overview::setupScreenshareExport() {
+    // Per-tile noscreenshare blackout. Must not fail plugin init or spam notifies.
+    // See noshare_cover_compat.hpp: Path C = noshare-cover extra-rect API (dual-view, no
+    // local black); Path B = cover without API → Option B while SS; Path A = we own
+    // renderMonitor.
+    if (m_renderMonitorHook) {
+        HyprlandAPI::removeFunctionHook(m_handle, m_renderMonitorHook);
+        m_renderMonitorHook = nullptr;
+    }
+    noshare_cover::unbind();
+    noshare_cover::g_goneFlag = false;
+    g_screenshareExportOrig   = nullptr;
+    g_exportDualView          = false;
+    m_coverPathActive         = false;
+
+    // Itanium names of CScreenshareFrame::renderMonitor / ::render(Render::CRenderContext&) on 0.57.
+    static constexpr const char* kMangledRenderMonitor = "_ZN11Screenshare17CScreenshareFrame13renderMonitorERN6Render14CRenderContextE";
+    static constexpr const char* kMangledRender        = "_ZN11Screenshare17CScreenshareFrame6renderERN6Render14CRenderContextE";
+
+    // Fallback by demangled name: the method itself, not renderMonitorRegion / renderWindow,
+    // lambdas inside it or its .cold part.
+    auto findByName = [&](const char* shortName, std::string_view exact) -> void* {
+        for (const auto& mt : HyprlandAPI::findFunctionsByName(m_handle, shortName)) {
+            if (std::string_view{mt.demangled}.ends_with(exact))
+                return mt.address;
+        }
+        return nullptr;
+    };
+
+    auto resolve = [&](const char* mangled, const char* shortName, std::string_view exact) -> void* {
+        if (void* p = dlsym(RTLD_DEFAULT, mangled))
+            return p;
+        return findByName(shortName, exact);
+    };
+
+    auto tryHook = [&](void* addr, const char* label) -> bool {
+        if (!addr)
+            return false;
+        auto* hook = HyprlandAPI::createFunctionHook(m_handle, addr, reinterpret_cast<void*>(&hkScreenshareExport));
+        if (!hook || !hook->hook()) {
+            if (hook)
+                HyprlandAPI::removeFunctionHook(m_handle, hook);
+            dbg(std::string("no_screen_share: could not hook ") + label + " (missing, unhookable, or already hooked by another plugin)");
+            return false;
+        }
+        m_renderMonitorHook     = hook;
+        g_screenshareExportOrig = reinterpret_cast<PRENDERSS>(hook->m_original);
+        dbg(std::string("no_screen_share: hooked ") + label);
+        return true;
+    };
+
+    const bool coverLoaded = noshare_cover::isLoaded();
+    bool       compatOn    = true;
+    if (const auto it = g_config.ints.find("plugin:gloview:noshare_cover_compat"); it != g_config.ints.end() && it->second)
+        compatOn = static_cast<int>(it->second->value()) != 0;
+    // RTLD_LOCAL: bind via dl_iterate_phdr + dlopen(RTLD_NOLOAD); null-safe if missing.
+    const bool apiReady = coverLoaded && noshare_cover::tryBind();
+    const auto path     = noshare_cover::choosePath(coverLoaded, compatOn, apiReady);
+    dbg(std::string("noshare_cover_compat: cover_loaded=") + (coverLoaded ? "1" : "0") + " api=" + (apiReady ? "1" : "0") + " compat=" + (compatOn ? "1" : "0") +
+        " → " + noshare_cover::pathLabel(path));
+
+    void* addrMonitor = resolve(kMangledRenderMonitor, "renderMonitor", "CScreenshareFrame::renderMonitor(Render::CRenderContext&)");
+    void* addrRender  = resolve(kMangledRender, "render", "CScreenshareFrame::render(Render::CRenderContext&)");
+
+    auto takePathB = [&](const char* reason) {
+        // Optional ::render() hook is best-effort only (may be a no-op if inlined/wrong
+        // GL state after render returns); do NOT set g_exportDualView.
+        dbg(std::string("no_screen_share: ") + reason);
+        if (tryHook(addrRender, "Screenshare::CScreenshareFrame::render()"))
+            dbg("no_screen_share: export render() hooked (best-effort); Option B while sharing");
+        else
+            dbg("no_screen_share: no export hook; Option B while sharing");
+    };
+
+    m_coverPathActive = path != noshare_cover::Path::A_DualView;
+    if (path == noshare_cover::Path::C_CoverApi) {
+        // Cover paints extra rects on the share path; local tiles stay live.
+        g_exportDualView = true;
+        dbg("no_screen_share: noshare-cover extra-rect API — dual-view via Path C (no renderMonitor fight)");
+    } else if (path == noshare_cover::Path::B_Coexist) {
+        // Cover without API: never fight for renderMonitor; Option B while sharing.
+        takePathB("noshare-cover loaded without extra-rect API — skipping renderMonitor (Path B)");
+    } else if (tryHook(addrMonitor, "Screenshare::CScreenshareFrame::renderMonitor()")) {
+        // Exclusive trampoline → dual-view: live local tiles, black on export FB only.
+        g_exportDualView = true;
+        dbg("no_screen_share: dual-view export blackout active");
+    } else {
+        // Hook failed (cover loaded after us, another owner, or missing symbol).
+        takePathB("renderMonitor unavailable — Path B while sharing");
+    }
+}
+
+// Config reloaded (also right after any plugin load/unload) or noshare-cover said goodbye:
+// redo the path choice if it no longer matches whether noshare-cover is loaded.
+// Re-pick outside the render pass (hooking functions mid-frame is not safe).
+void Overview::scheduleCoverResync() {
+    if (!g_pEventLoopManager)
+        return;
+    if (!m_coverResyncTimer) {
+        m_coverResyncTimer = makeShared<CEventLoopTimer>(
+            std::chrono::milliseconds(1),
+            [this](SP<CEventLoopTimer> self, void*) {
+                self->updateTimeout(std::nullopt);
+                resyncScreenshareExport();
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(m_coverResyncTimer);
+    } else
+        m_coverResyncTimer->updateTimeout(std::chrono::milliseconds(1));
+}
+
+void Overview::resyncScreenshareExport() {
+    const bool coverNow = noshare_cover::isLoaded();
+    if (!noshare_cover::g_goneFlag && coverNow == m_coverPathActive)
+        return;
+    dbg(std::string("noshare_cover_compat: cover ") + (coverNow ? "appeared" : "gone") + ", re-picking share path");
+    setupScreenshareExport();
+}
+
+// Screencopy export path (ScreenshareFrame::renderMonitor): black only preview boxes for
+// windows with Hyprland noscreenshare / no_screen_share. Overview chrome and other tiles
+// stay visible in the share. Never called from the local interactive render path.
+void Overview::blackoutNoScreenShareExportTiles(Render::CRenderContext& ctx) const {
+    const auto m = m_monitor.lock();
+    if (!m || !g_pHyprRenderer)
+        return;
+    const double scale = m->m_scale;
+    if (!(scale > 0.0))
+        return;
+
+    auto maybeBlack = [&](const PHLWINDOW& w, const CBox& px, double roundLogical) {
+        if (!windowNoScreenShare(w) || !(px.w > 0.0 && px.h > 0.0))
+            return;
+        g_pHyprRenderer->draw(ctx,
+                              CRectPassElement::SRectData{
+                                  .box           = px,
+                                  .color         = Colors::BLACK,
+                                  .round         = static_cast<int>(roundLogical * scale),
+                                  .roundingPower = w->presentation().roundingPower(),
+                              },
+                              px);
+    };
+
+    // Same startRenderPass + draw pattern Hyprland uses after the mirror blit.
+    g_pHyprRenderer->startRenderPass(ctx);
+
+    const double previewRound = static_cast<double>(cfgInt("plugin:gloview:preview_round", 12));
+    const int    dragIdx      = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        if (static_cast<int>(i) == dragIdx)
+            continue;
+        const auto w = m_tiles[i].win.lock();
+        if (!w || !w->mapped() || w->isHidden())
+            continue;
+        const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
+        maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, previewRound);
+    }
+
+    if (dragIdx >= 0) {
+        const auto w = m_tiles[static_cast<size_t>(dragIdx)].win.lock();
+        if (w && w->mapped() && !w->isHidden()) {
+            const LRect lb = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
+            maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, previewRound);
+        }
+    }
+
+    if (!m_prevTiles.empty()) {
+        const Vector2D off = wsSlideOffset(true);
+        for (const auto& t : m_prevTiles) {
+            const auto w = t.win.lock();
+            if (!w || !w->mapped() || w->isHidden())
+                continue;
+            maybeBlack(w, CBox{(t.target.x + off.x) * scale, (t.target.y + off.y) * scale, t.target.w * scale, t.target.h * scale}, previewRound);
+        }
+    }
+
+    if (!m_strip.empty() && eased() > 0.01) {
+        const Vector2D slide  = stripSlide(eased());
+        const Vector2D scroll = stripScroll();
+        for (const auto& it : m_strip) {
+            if (it.isPlus || it.isAll)
+                continue;
+            LRect card = it.card;
+            card.x += slide.x + scroll.x;
+            card.y += slide.y + scroll.y;
+            for (const auto& sw : it.wins) {
+                const auto w = sw.win.lock();
+                if (!w || !w->mapped() || w->isHidden() || isFlying(w))
+                    continue;
+                const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h)};
+                const CBox  slotPx{slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale};
+                const CBox  cardPx{card.x * scale, card.y * scale, card.w * scale, card.h * scale};
+                const CBox  clipPx = intersectBox(slotPx, cardPx);
+                if (clipPx.w <= 0.0 || clipPx.h <= 0.0)
+                    continue;
+                const bool   cropped    = !roughly(clipPx.w, slotPx.w, 0.01) || !roughly(clipPx.h, slotPx.h, 0.01);
+                const double stripRound = cropped ? 0.0 : std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)), std::min(slot.w, slot.h) * 0.35);
+                maybeBlack(w, clipPx, stripRound);
+            }
+        }
+    }
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!w || !w->mapped() || w->isHidden())
+            continue;
+        const LRect lb = flyBox(f);
+        maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, flyRound(lb));
+    }
+}
+
+// Path C: push noscreenshare overview tile boxes to noshare-cover each frame (global layout
+// pixels). clear()+add; rects persist until the next clear. No-op if API unbound / honor off.
+void Overview::syncNoshareCoverExtraRects() const {
+    if (noshare_cover::g_goneFlag)
+        const_cast<Overview*>(this)->scheduleCoverResync();
+    if (!noshare_cover::apiAvailable())
+        return;
+    const auto m = m_monitor.lock();
+    if (!m_active || !honorNoScreenShare() || !m) {
+        noshare_cover::clearExtraRects();
+        return;
+    }
+
+    noshare_cover::beginTiles();
+
+    const int      monId        = static_cast<int>(m->m_id);
+    const Vector2D monPos       = m->m_position;
+    const double   previewRound = static_cast<double>(cfgInt("plugin:gloview:preview_round", 12));
+    const int      dragIdx      = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+
+    auto addFor = [&](const PHLWINDOW& w, const LRect& lb, double rounding) {
+        if (!windowNoScreenShare(w) || !(lb.w > 0.0 && lb.h > 0.0))
+            return;
+        // Global layout pixels (same space as window position/size); cover subtracts mon pos,
+        // applies scale, subtracts capture origin.
+        // v2: fill with the window's own cover (same as its real box in the share)
+        noshare_cover::addExtraRect(monId, monPos.x + lb.x, monPos.y + lb.y, lb.w, lb.h, rounding, reinterpret_cast<uint64_t>(w.get()));
+    };
+
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        if (static_cast<int>(i) == dragIdx)
+            continue;
+        const auto w = m_tiles[i].win.lock();
+        if (!w || !w->mapped() || w->isHidden())
+            continue;
+        addFor(w, tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i))), previewRound);
+    }
+
+    if (dragIdx >= 0) {
+        const auto w = m_tiles[static_cast<size_t>(dragIdx)].win.lock();
+        if (w && w->mapped() && !w->isHidden())
+            addFor(w, tileContentBox(static_cast<size_t>(dragIdx), dragBox()), previewRound);
+    }
+
+    if (!m_prevTiles.empty()) {
+        const Vector2D off = wsSlideOffset(true);
+        for (const auto& t : m_prevTiles) {
+            const auto w = t.win.lock();
+            if (!w || !w->mapped() || w->isHidden())
+                continue;
+            addFor(w, LRect{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h}, previewRound);
+        }
+    }
+
+    if (!m_strip.empty() && eased() > 0.01) {
+        const Vector2D slide  = stripSlide(eased());
+        const Vector2D scroll = stripScroll();
+        for (const auto& it : m_strip) {
+            if (it.isPlus || it.isAll)
+                continue;
+            LRect card = it.card;
+            card.x += slide.x + scroll.x;
+            card.y += slide.y + scroll.y;
+            for (const auto& sw : it.wins) {
+                const auto w = sw.win.lock();
+                if (!w || !w->mapped() || w->isHidden() || isFlying(w))
+                    continue;
+                const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h)};
+                const LRect clip = intersectRect(slot, card);
+                if (!(clip.w > 0.0 && clip.h > 0.0))
+                    continue;
+                const bool   cropped    = !roughly(clip.w, slot.w, 0.01) || !roughly(clip.h, slot.h, 0.01);
+                const double stripRound = cropped ? 0.0 : std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)), std::min(slot.w, slot.h) * 0.35);
+                addFor(w, clip, stripRound);
+            }
+        }
+    }
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!w || !w->mapped() || w->isHidden())
+            continue;
+        const LRect lb = flyBox(f);
+        addFor(w, lb, flyRound(lb));
+    }
+
+    noshare_cover::commitTiles(monId);
 }
 
 // ---- config -----------------------------------------------------------------
@@ -1069,6 +1461,7 @@ void Overview::close() {
 // dlclose is safe. Hooks stay installed (harmless at m_active=false; dtor removes them). Unlike
 // deactivate it does NOT commit the displayed workspace — unload snaps back to the live one.
 void Overview::hardClose() {
+    noshare_cover::clearExtraRects(); // unload-safe: drop share covers before tearing down
     // Kill the recapture timer FIRST: its fire lambda captures `this` in this .so, so a
     // tick still pending at unload is the IPC-dead-spin hazard.
     m_recaptureLeft = 0;
@@ -1874,6 +2267,8 @@ void Overview::renderStage(const Event::SRenderStageEvent& ev) {
 
     updateHover(); // keep hover fresh even when the pointer is warped, not moved
     syncTiles(); // window opened/closed/moved on this workspace → reflow the grid
+    // Path C: refresh noshare-cover extra rects to current tile layout (clear+add).
+    syncNoshareCoverExtraRects();
 
     // exit_on_switch: live workspace changed underneath us. switchToWorkspace only moves the
     // DISPLAYED workspace, so this fires only on genuine external switches.
@@ -3716,6 +4111,7 @@ bool Overview::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& mon) const
 }
 
 void Overview::deactivate() {
+    noshare_cover::clearExtraRects(); // drop share tile covers when overview goes idle
     restoreLayers(); // safety net: normally close() already restored; harmless if empty
     restoreFill();   // drop the fill-small override so real windows render normally again
     m_canvasPos.clear();

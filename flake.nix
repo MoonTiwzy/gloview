@@ -55,7 +55,7 @@
 
         meta = {
           description = "macOS Mission Control-style overview for Hyprland";
-          homepage = "https://github.com/fedsfarm/gloview";
+          homepage = "https://github.com/MoonTiwzy/gloview";
           license = lib.licenses.gpl3Plus;
           platforms = lib.platforms.linux;
         };
