@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <dlfcn.h>
 #include <unordered_set>
+#include <string_view>
 #include <utility>
 
 #include <hyprland/src/Compositor.hpp>
@@ -18,9 +20,10 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
+#include "hypr_compat.hpp" // Window / workspace / IPC / modifier ABI shims
+#include "noshare_cover_compat.hpp" // Path A/B vs noshare-cover renderMonitor
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
@@ -36,6 +39,7 @@
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
+#include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -182,11 +186,11 @@ bool hasStablePreviewUV(const PHLWINDOW& window, const SP<CWLSurfaceResource>& s
         return false;
 
     const auto& drag = g_layoutManager->dragController();
-    if (drag && drag->target() == window->m_target && drag->mode() >= MBIND_RESIZE)
+    if (drag && drag->target() == window->layoutTarget() && drag->mode() >= MBIND_RESIZE)
         return false;
 
     const auto& state = surface->m_current;
-    if (window->m_isX11 && state.viewport.hasSource)
+    if (winIsX11(window) && state.viewport.hasSource)
         return false;
     if (texBoxLogical.size() != state.size)
         return false;
@@ -196,10 +200,10 @@ bool hasStablePreviewUV(const PHLWINDOW& window, const SP<CWLSurfaceResource>& s
         expectedPx = (state.viewport.destination * monitor->m_scale).round();
     else if (state.viewport.hasSource)
         expectedPx = (state.viewport.source.size() * monitor->m_scale).round();
-    else if (mainSurface && window->getReportedSize() != state.size)
+    else if (mainSurface && winReportedSize(window) != state.size)
         expectedPx = (state.size * monitor->m_scale).round();
     else if (mainSurface)
-        expectedPx = (window->getReportedSize() * monitor->m_scale).round();
+        expectedPx = (winReportedSize(window) * monitor->m_scale).round();
     else
         expectedPx = texBoxPx.size();
 
@@ -234,15 +238,47 @@ void fixFractionalScaleUV(const SP<CWLSurfaceResource>& surface, const PHLMONITO
         uvMax -= misalignment / bufferSize;
 }
 
+// Forward decls — used by renderWindowLive Option B before the full noscreenshare block.
+using PRENDERSS = void (*)(void*);
+PRENDERSS g_screenshareExportOrig = nullptr;
+// True when share blackout is handled off the local overview pass (dual-view):
+// Path A (we own renderMonitor) or Path C (noshare-cover extra-rect API).
+// When false and cover owns the trampoline without API → Option B while sharing.
+bool g_exportDualView = false;
+bool windowNoScreenShare(const PHLWINDOW& w);
+bool honorNoScreenShare();
+
 // Render a window's LIVE surface tree scaled into `destPx`, clipped to `clipPx`
 // (both monitor PIXEL coords) via real CSurfacePassElements. No crop rect to drift,
 // so immune to snapshots' stale/mis-cropped tiles; works on hidden workspaces.
 void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& destPx, const CBox& clipPx, float alpha, const Time::steady_tp& when,
                       int previewFilterGrid, double roundSlotPx = 0.0) {
-    if (!w || !mon || !w->m_isMapped || !w->wlSurface() || !w->wlSurface()->resource())
+    if (!winMapped(w) || !mon || !w->wlSurface() || !w->wlSurface()->resource())
         return;
     if (!(destPx.w > 0 && destPx.h > 0))
         return;
+
+    // Option B (fallback when noshare-cover is loaded but has no extra-rect API): when
+    // g_exportDualView=false and this output is being screenshared, bake solid black into
+    // the overview pass for noscreenshare tiles. Mirror capture carries black to Discord.
+    // Local also sees black for those tiles while sharing — honest tradeoff. With dual-view
+    // (Path A own renderMonitor, or Path C cover extra-rect API) keep live tiles here.
+    if (honorNoScreenShare() && windowNoScreenShare(w) && !g_exportDualView) {
+        bool sharing = false;
+        if (Screenshare::mgr())
+            sharing = Screenshare::mgr()->isOutputBeingSSd(mon);
+        if (sharing) {
+            const double roundPx = roundSlotPx > 0.0 ? roundSlotPx * mon->m_scale : 0.0;
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(CRectPassElement::SRectData{
+                .box           = destPx,
+                .color         = CHyprColor{0.F, 0.F, 0.F, std::clamp(alpha, 0.F, 1.F)},
+                .round         = static_cast<int>(roundPx),
+                .roundingPower = winRoundingPower(w),
+                .clipBox       = clipPx,
+            }));
+            return;
+        }
+    }
 
     // When reported size > committed buffer (CWLSurface::small(): X11 size hints/mid-resize),
     // getTexBox CENTERS it at real size, leaving an uncovered margin. m_fillIgnoreSmall
@@ -270,7 +306,7 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     if (!(scaleMod > 0.F))
         return;
 
-    const Vector2D logicalTL = pos + w->m_floatingOffset;
+    const Vector2D logicalTL = pos + winFloatingOffset(w);
     const Vector2D scaledTL  = (logicalTL - mon->m_position) * mon->m_scale;
     const Vector2D translate = destPx.pos() / scaleMod - scaledTL;
 
@@ -298,7 +334,7 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     data.alpha          = std::clamp(alpha, 0.F, 1.F);
     data.decorate       = false;
     data.rounding       = roundSlotPx > 0.0 ? roundSlotPx * mon->m_scale : 0.0;
-    data.roundingPower  = w->roundingPower();
+    data.roundingPower  = winRoundingPower(w);
     data.blur           = false;
     data.pWindow        = w;
     data.clipBox        = clipPx;
@@ -359,8 +395,11 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
 
 using PSHOULDRENDER              = bool (*)(void*, PHLWINDOW, PHLMONITOR);
 using PSHOULDRENDERWINDOW        = bool (*)(void*, PHLWINDOW);
-PSHOULDRENDER       g_shouldRenderOrig       = nullptr;
-PSHOULDRENDERWINDOW g_shouldRenderWindowOrig = nullptr;
+// Member fns void(CScreenshareFrame::*)() — thisptr is first arg. Same ABI for
+// renderMonitor() and render(); we prefer ::render() so noshare-cover can own
+// renderMonitor. g_screenshareExportOrig is declared above (Option B needs it).
+PSHOULDRENDER         g_shouldRenderOrig         = nullptr;
+PSHOULDRENDERWINDOW   g_shouldRenderWindowOrig   = nullptr;
 
 bool hkShouldRenderWindow(void* thisptr, PHLWINDOW window, PHLMONITOR monitor) {
     if (g_overview) {
@@ -378,6 +417,47 @@ bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
     if (g_overview && g_overview->forceRenderWindow(window))
         return true;
     return g_shouldRenderWindowOrig ? g_shouldRenderWindowOrig(thisptr, window) : true;
+}
+
+// plugin:gloview:no_screen_share — honor Hyprland noscreenshare on overview *tiles* in the
+// screencopy export only. Hyprland blacks noscreenshare windows at their real boxes in
+// Screenshare::CScreenshareFrame::renderMonitor AFTER the mirror blit (ScreenshareFrame.cpp
+// ~224–311). Overview relocates those surfaces into preview tiles, so we black ONLY those
+// tile boxes on the same export path. Local swapchain / interactive overview keeps live
+// previews. Do NOT full-buffer black, mirror FB clear, bindTempFB/glClear, or RENDER_POST EGL.
+bool windowNoScreenShare(const PHLWINDOW& w) {
+    return winNoScreenShare(w);
+}
+
+bool honorNoScreenShare() {
+    const auto it = g_config.ints.find("plugin:gloview:no_screen_share");
+    if (it == g_config.ints.end() || !it->second)
+        return true;
+    return static_cast<int>(it->second->value()) != 0;
+}
+
+bool shouldHonorNoScreenShareExport() {
+    if (!g_overview || !g_overview->active())
+        return false;
+    if (!honorNoScreenShare())
+        return false;
+    if (!g_pHyprRenderer)
+        return false;
+    const auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    if (!mon || mon != g_overview->monitor())
+        return false;
+    return true;
+}
+
+// Runs on the screencopy export path (after mirror blit + Hyprland noscreenshare
+// blackouts), already inside beginRender(RENDER_MODE_TO_BUFFER / FULL_FAKE).
+// Installed on CScreenshareFrame::renderMonitor when free; else on ::render() so we
+// still run after another plugin's renderMonitor hook (noshare-cover, etc.).
+void hkScreenshareExport(void* thisptr) {
+    if (g_screenshareExportOrig)
+        g_screenshareExportOrig(thisptr);
+    if (shouldHonorNoScreenShareExport())
+        g_overview->blackoutNoScreenShareExportTiles();
 }
 
 CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
@@ -495,11 +575,18 @@ Overview::~Overview() {
     // inactive overview and no dangling refs.
     m_active  = false;
     m_opening = false;
+    m_configReloadL.reset();
+    if (m_coverResyncTimer && g_pEventLoopManager) {
+        m_coverResyncTimer->cancel();
+        g_pEventLoopManager->removeTimer(m_coverResyncTimer);
+        m_coverResyncTimer.reset();
+    }
+    noshare_cover::unbind(); // clear extra rects, unregister, drop any handle
     PreviewFilter::reset();
     restoreLayers(); // never leave a bar stuck at alpha 0 if we're torn down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
     if (const auto ws = m_newWs.lock()) // don't leak a persistent workspace either
-        ws->setPersistent(false);
+        wsSetPersistent(ws, false);
     m_newWs.reset();
     m_tiles.clear();
     m_strip.clear();
@@ -521,8 +608,14 @@ Overview::~Overview() {
         HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderWindowHook);
         m_shouldRenderWindowHook = nullptr;
     }
+    if (m_renderMonitorHook) {
+        HyprlandAPI::removeFunctionHook(m_handle, m_renderMonitorHook);
+        m_renderMonitorHook = nullptr;
+    }
     g_shouldRenderOrig       = nullptr;
     g_shouldRenderWindowOrig = nullptr;
+    g_screenshareExportOrig  = nullptr;
+    g_exportDualView         = false;
 }
 
 bool Overview::initialize() {
@@ -595,7 +688,362 @@ bool Overview::initialize() {
         return false;
     }
     g_shouldRenderWindowOrig = reinterpret_cast<PSHOULDRENDERWINDOW>(m_shouldRenderWindowHook->m_original);
+
+    setupScreenshareExport();
+
+    // Re-pick the share path whenever the plugin set may have changed: Hyprland reloads the
+    // config after every plugin load/unload. This is what makes load order irrelevant.
+    m_configReloadL = events.config.reloaded.listen([this] { resyncScreenshareExport(); });
+
     return true;
+}
+
+// Pick how noscreenshare preview tiles are handled in screen captures (Path A/B/C, see
+// noshare_cover_compat.hpp). Safe to call again at any time: tears the previous choice down.
+void Overview::setupScreenshareExport() {
+    // Per-tile noscreenshare blackout. Must not fail plugin init or spam notifies.
+    // See noshare_cover_compat.hpp: Path C = noshare-cover extra-rect API (dual-view, no
+    // local black); Path B = cover without API → Option B while SS; Path A = we own
+    // renderMonitor. Verified on Hyprland v0.56.2 and 83cf6a6.
+    if (m_renderMonitorHook) {
+        HyprlandAPI::removeFunctionHook(m_handle, m_renderMonitorHook);
+        m_renderMonitorHook = nullptr;
+    }
+    noshare_cover::unbind();
+    noshare_cover::g_goneFlag = false;
+    g_screenshareExportOrig   = nullptr;
+    g_exportDualView          = false;
+    m_coverPathActive         = false;
+    {
+        // Stable Itanium names — identical on 0.56.2 (efb5099) and 83cf6a6.
+        static constexpr const char* kMangledRenderMonitor =
+            "_ZN11Screenshare17CScreenshareFrame13renderMonitorEv";
+        static constexpr const char* kMangledRender =
+            "_ZN11Screenshare17CScreenshareFrame6renderEv";
+
+        auto findByName = [&](const char* shortName, const char* demangleNeedle) -> void* {
+            const auto matches = HyprlandAPI::findFunctionsByName(m_handle, shortName);
+            for (const auto& mt : matches) {
+                if (mt.demangled.find(demangleNeedle) == std::string::npos)
+                    continue;
+                if (mt.demangled.find(".cold") != std::string::npos)
+                    continue;
+                // Exact method, not renderMonitorRegion / nested lambdas.
+                if (demangleNeedle == std::string_view("CScreenshareFrame::renderMonitor") &&
+                    mt.demangled.find("renderMonitorRegion") != std::string::npos)
+                    continue;
+                // For ::render(), require the empty arg list so we don't pick renderWindow/etc.
+                if (demangleNeedle == std::string_view("CScreenshareFrame::render") &&
+                    mt.demangled.find("CScreenshareFrame::render()") == std::string::npos)
+                    continue;
+                return mt.address;
+            }
+            return nullptr;
+        };
+
+        auto resolve = [&](const char* mangled, const char* shortName, const char* demangleNeedle) -> void* {
+            if (void* p = dlsym(RTLD_DEFAULT, mangled))
+                return p;
+            return findByName(shortName, demangleNeedle);
+        };
+
+        auto tryHook = [&](void* addr, const char* label) -> bool {
+            if (!addr)
+                return false;
+            auto* hook = HyprlandAPI::createFunctionHook(m_handle, addr, reinterpret_cast<void*>(&hkScreenshareExport));
+            if (!hook || !hook->hook()) {
+                if (hook) {
+                    HyprlandAPI::removeFunctionHook(m_handle, hook);
+                    hook = nullptr;
+                }
+                dbg(std::string("no_screen_share: could not hook ") + label +
+                    " (missing, unhookable, or already hooked by another plugin)");
+                return false;
+            }
+            m_renderMonitorHook     = hook;
+            g_screenshareExportOrig = reinterpret_cast<PRENDERSS>(hook->m_original);
+            dbg(std::string("no_screen_share: hooked ") + label);
+            return true;
+        };
+
+        const bool coverLoaded = noshare_cover::isLoaded();
+        bool       compatOn    = true;
+        if (const auto it = g_config.ints.find("plugin:gloview:noshare_cover_compat"); it != g_config.ints.end() && it->second)
+            compatOn = static_cast<int>(it->second->value()) != 0;
+        // RTLD_LOCAL: bind via dl_iterate_phdr + dlopen(RTLD_NOLOAD); null-safe if missing.
+        const bool apiReady = coverLoaded && noshare_cover::tryBind();
+        const auto path     = noshare_cover::choosePath(coverLoaded, compatOn, apiReady);
+        dbg(std::string("noshare_cover_compat: cover_loaded=") + (coverLoaded ? "1" : "0") +
+            " api=" + (apiReady ? "1" : "0") + " compat=" + (compatOn ? "1" : "0") +
+            " → " + noshare_cover::pathLabel(path));
+
+        void* addrMonitor = resolve(kMangledRenderMonitor, "renderMonitor", "CScreenshareFrame::renderMonitor");
+        void* addrRender  = resolve(kMangledRender, "render", "CScreenshareFrame::render");
+
+        auto takePathB = [&](const char* reason) {
+            // Optional ::render() hook is best-effort only (may be a no-op if inlined/wrong
+            // GL state after render returns); do NOT set g_exportDualView.
+            dbg(std::string("no_screen_share: ") + reason);
+            if (tryHook(addrRender, "Screenshare::CScreenshareFrame::render()"))
+                dbg("no_screen_share: export render() hooked (best-effort); Option B while sharing");
+            else
+                dbg("no_screen_share: no export hook; Option B while sharing");
+        };
+
+        m_coverPathActive = path != noshare_cover::Path::A_DualView;
+        if (path == noshare_cover::Path::C_CoverApi) {
+            // Cover paints extra rects on the share path; local tiles stay live.
+            g_exportDualView = true;
+            dbg("no_screen_share: noshare-cover extra-rect API — dual-view via Path C (no renderMonitor fight)");
+        } else if (path == noshare_cover::Path::B_Coexist) {
+            // Cover without API: never fight for renderMonitor; Option B while sharing.
+            takePathB("noshare-cover loaded without extra-rect API — skipping renderMonitor (Path B)");
+        } else if (tryHook(addrMonitor, "Screenshare::CScreenshareFrame::renderMonitor()")) {
+            // Exclusive trampoline → dual-view: live local tiles, black on export FB only.
+            g_exportDualView = true;
+            dbg("no_screen_share: dual-view export blackout active");
+        } else {
+            // Hook failed (cover loaded after us, another owner, or missing symbol).
+            takePathB("renderMonitor unavailable — Path B while sharing");
+        }
+    }
+}
+
+// Config reloaded (also right after any plugin load/unload) or noshare-cover said goodbye:
+// redo the path choice if it no longer matches whether noshare-cover is loaded.
+// Re-pick outside the render pass (hooking functions mid-frame is not safe).
+void Overview::scheduleCoverResync() {
+    if (!g_pEventLoopManager)
+        return;
+    if (!m_coverResyncTimer) {
+        m_coverResyncTimer = makeShared<CEventLoopTimer>(
+            std::chrono::milliseconds(1), [this](SP<CEventLoopTimer> self, void*) {
+                self->updateTimeout(std::nullopt);
+                resyncScreenshareExport();
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(m_coverResyncTimer);
+    } else
+        m_coverResyncTimer->updateTimeout(std::chrono::milliseconds(1));
+}
+
+void Overview::resyncScreenshareExport() {
+    const bool coverNow = noshare_cover::isLoaded();
+    if (!noshare_cover::g_goneFlag && coverNow == m_coverPathActive)
+        return;
+    dbg(std::string("noshare_cover_compat: cover ") + (coverNow ? "appeared" : "gone") + ", re-picking share path");
+    setupScreenshareExport();
+}
+
+// Screencopy export path (ScreenshareFrame::renderMonitor): black only preview boxes for
+// windows with Hyprland noscreenshare / no_screen_share. Overview chrome and other tiles
+// stay visible in the share. Never called from the local interactive render path.
+void Overview::blackoutNoScreenShareExportTiles() const {
+    if (!g_pHyprRenderer)
+        return;
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
+    const double scale = m->m_scale;
+    if (!(scale > 0.0))
+        return;
+
+    auto drawBlack = [](const CBox& px, int roundPx, float roundingPower) {
+        if (!(px.w > 0.0 && px.h > 0.0))
+            return;
+        g_pHyprRenderer->draw(CRectPassElement::SRectData{
+                                  .box           = px,
+                                  .color         = Colors::BLACK,
+                                  .round         = roundPx,
+                                  .roundingPower = roundingPower,
+                              },
+                              px);
+    };
+
+    auto maybeBlack = [&](const PHLWINDOW& w, const CBox& px, double roundLogical) {
+        if (!windowNoScreenShare(w))
+            return;
+        drawBlack(px, static_cast<int>(roundLogical * scale), winRoundingPower(w));
+    };
+
+    // Same startRenderPass + draw pattern Hyprland uses after the mirror blit.
+    g_pHyprRenderer->startRenderPass();
+
+    const double previewRound = static_cast<double>(cfgInt("plugin:gloview:preview_round", 12));
+    const int    dragIdx =
+        (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        if (static_cast<int>(i) == dragIdx)
+            continue;
+        const auto w = m_tiles[i].win.lock();
+        if (!winMapped(w) || w->isHidden())
+            continue;
+        const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
+        maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, previewRound);
+    }
+
+    if (dragIdx >= 0) {
+        const auto w = m_tiles[static_cast<size_t>(dragIdx)].win.lock();
+        if (winMapped(w) && !w->isHidden()) {
+            const LRect lb = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
+            maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, previewRound);
+        }
+    }
+
+    if (!m_prevTiles.empty()) {
+        const Vector2D off = wsSlideOffset(true);
+        for (const auto& t : m_prevTiles) {
+            const auto w = t.win.lock();
+            if (!winMapped(w) || w->isHidden())
+                continue;
+            maybeBlack(w,
+                       CBox{(t.target.x + off.x) * scale, (t.target.y + off.y) * scale, t.target.w * scale, t.target.h * scale},
+                       previewRound);
+        }
+    }
+
+    if (!m_strip.empty() && eased() > 0.01) {
+        const Vector2D slide  = stripSlide(eased());
+        const Vector2D scroll = stripScroll();
+        for (const auto& it : m_strip) {
+            if (it.isPlus || it.isAll)
+                continue;
+            LRect card = it.card;
+            card.x += slide.x + scroll.x;
+            card.y += slide.y + scroll.y;
+            for (const auto& sw : it.wins) {
+                const auto w = sw.win.lock();
+                if (!winMapped(w) || w->isHidden())
+                    continue;
+                if (isFlying(w))
+                    continue;
+                const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w),
+                                 std::max(2.0, sw.rel.h * card.h)};
+                const CBox  slotPx{slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale};
+                const CBox  cardPx{card.x * scale, card.y * scale, card.w * scale, card.h * scale};
+                const CBox  clipPx = intersectBox(slotPx, cardPx);
+                if (clipPx.w <= 0.0 || clipPx.h <= 0.0)
+                    continue;
+                const bool   cropped = !roughly(clipPx.w, slotPx.w, 0.01) || !roughly(clipPx.h, slotPx.h, 0.01);
+                const double stripRound =
+                    cropped ? 0.0 :
+                              std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
+                                       std::min(slot.w, slot.h) * 0.35);
+                maybeBlack(w, clipPx, stripRound);
+            }
+        }
+    }
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!winMapped(w) || w->isHidden())
+            continue;
+        const LRect lb = flyBox(f);
+        maybeBlack(w, CBox{lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale}, flyRound(lb));
+    }
+}
+
+// Path C: push noscreenshare overview tile boxes to noshare-cover each frame (global layout
+// pixels). clear()+add; rects persist until the next clear. No-op if API unbound / honor off.
+void Overview::syncNoshareCoverExtraRects() const {
+    if (noshare_cover::g_goneFlag)
+        const_cast<Overview*>(this)->scheduleCoverResync();
+    if (!noshare_cover::apiAvailable())
+        return;
+    if (!m_active || !honorNoScreenShare()) {
+        noshare_cover::clearExtraRects();
+        return;
+    }
+    const auto m = m_monitor.lock();
+    if (!m) {
+        noshare_cover::clearExtraRects();
+        return;
+    }
+
+    noshare_cover::beginTiles();
+
+    const int      monId        = static_cast<int>(m->m_id);
+    const Vector2D monPos       = m->m_position;
+    const double   previewRound = static_cast<double>(cfgInt("plugin:gloview:preview_round", 12));
+    const int      dragIdx =
+        (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+
+    auto addFor = [&](const PHLWINDOW& w, const LRect& lb, double rounding) {
+        if (!windowNoScreenShare(w))
+            return;
+        if (!(lb.w > 0.0 && lb.h > 0.0))
+            return;
+        // Global layout pixels (same space as window position/size); cover subtracts mon pos,
+        // applies scale, subtracts capture origin.
+        // v2: fill with the window's own cover (same as its real box in the share)
+        noshare_cover::addExtraRect(monId, monPos.x + lb.x, monPos.y + lb.y, lb.w, lb.h, rounding, reinterpret_cast<uint64_t>(w.get()));
+    };
+
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        if (static_cast<int>(i) == dragIdx)
+            continue;
+        const auto w = m_tiles[i].win.lock();
+        if (!winMapped(w) || w->isHidden())
+            continue;
+        addFor(w, tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i))), previewRound);
+    }
+
+    if (dragIdx >= 0) {
+        const auto w = m_tiles[static_cast<size_t>(dragIdx)].win.lock();
+        if (winMapped(w) && !w->isHidden())
+            addFor(w, tileContentBox(static_cast<size_t>(dragIdx), dragBox()), previewRound);
+    }
+
+    if (!m_prevTiles.empty()) {
+        const Vector2D off = wsSlideOffset(true);
+        for (const auto& t : m_prevTiles) {
+            const auto w = t.win.lock();
+            if (!winMapped(w) || w->isHidden())
+                continue;
+            addFor(w, LRect{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h}, previewRound);
+        }
+    }
+
+    if (!m_strip.empty() && eased() > 0.01) {
+        const Vector2D slide  = stripSlide(eased());
+        const Vector2D scroll = stripScroll();
+        for (const auto& it : m_strip) {
+            if (it.isPlus || it.isAll)
+                continue;
+            LRect card = it.card;
+            card.x += slide.x + scroll.x;
+            card.y += slide.y + scroll.y;
+            for (const auto& sw : it.wins) {
+                const auto w = sw.win.lock();
+                if (!winMapped(w) || w->isHidden())
+                    continue;
+                if (isFlying(w))
+                    continue;
+                const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w),
+                                 std::max(2.0, sw.rel.h * card.h)};
+                const LRect clip = intersectRect(slot, card);
+                if (!(clip.w > 0.0 && clip.h > 0.0))
+                    continue;
+                const bool   cropped = !roughly(clip.w, slot.w, 0.01) || !roughly(clip.h, slot.h, 0.01);
+                const double stripRound =
+                    cropped ? 0.0 :
+                              std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
+                                       std::min(slot.w, slot.h) * 0.35);
+                addFor(w, clip, stripRound);
+            }
+        }
+    }
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!winMapped(w) || w->isHidden())
+            continue;
+        const LRect lb = flyBox(f);
+        addFor(w, lb, flyRound(lb));
+    }
+
+    noshare_cover::commitTiles(monId);
 }
 
 // ---- config -----------------------------------------------------------------
@@ -695,7 +1143,7 @@ void Overview::autodeleteEmpty() {
     // Copy, not the live view: setPersistent(false) can drop the last ref and destroy the
     // workspace mid-iteration.
     for (const auto& ws : State::workspaceState()->workspacesCopy()) {
-        if (!ws || ws->m_isSpecialWorkspace || ws->m_id <= 0) // leave scratchpads and named (-1337…) workspaces alone
+        if (!ws || !wsIsNumberedPositive(ws)) // leave scratchpads and named (-1337…) workspaces alone
             continue;
         if (ws->m_monitor.lock() != m) // only this monitor's — other outputs aren't ours to prune
             continue;
@@ -707,15 +1155,15 @@ void Overview::autodeleteEmpty() {
         // was added. Releasing it when it is genuinely abandoned is switchToWorkspace's job.
         if (ws == held)
             continue;
-        if (ws->isVisible())           // active on some monitor
+        if (wsVisible(ws))           // active on some monitor
             continue;
         if (workspaceOccupied(ws))
             continue;
-        if (!ws->isPersistent())       // nothing pinning it; Hyprland reaps it without our help
+        if (!wsIsPersistent(ws))       // nothing pinning it; Hyprland reaps it without our help
             continue;
 
-        ws->setPersistent(false);
-        dbg("autodelete: released empty workspace " + std::to_string(ws->m_id));
+        wsSetPersistent(ws, false);
+        dbg("autodelete: released empty workspace " + std::to_string(wsNumericId(ws)));
     }
 }
 
@@ -726,7 +1174,7 @@ bool Overview::wsHasMappedWindows(const PHLWORKSPACE& ws) const {
     if (!ws)
         return false;
     for (const auto& win : Desktop::windowState()->windows())
-        if (win && win->m_isMapped && !win->isHidden() && win->m_workspace == ws)
+        if (winMapped(win) && !win->isHidden() && win->m_workspace == ws)
             return true;
     return false;
 }
@@ -745,7 +1193,7 @@ bool Overview::workspaceOccupied(const PHLWORKSPACE& ws) const {
 
 int Overview::nextWorkspaceId() const {
     int id = 1;
-    while (State::workspaceState()->query().id(id).run())
+    while (wsQueryById(id))
         ++id;
     return id;
 }
@@ -753,7 +1201,7 @@ int Overview::nextWorkspaceId() const {
 // A create-on-use card advertises the id it will take (dynamic_workspaces labels the trailing
 // card with it), so honour that id unless something claimed it between the build and the click.
 int Overview::resolveNewId(int wanted) const {
-    if (wanted > 0 && !State::workspaceState()->query().id(wanted).run())
+    if (wanted > 0 && !wsQueryById(wanted))
         return wanted;
     return nextWorkspaceId();
 }
@@ -1011,6 +1459,7 @@ void Overview::close() {
 // dlclose is safe. Hooks stay installed (harmless at m_active=false; dtor removes them). Unlike
 // deactivate it does NOT commit the displayed workspace — unload snaps back to the live one.
 void Overview::hardClose() {
+    noshare_cover::clearExtraRects(); // unload-safe: drop share covers before tearing down
     // Kill the recapture timer FIRST: its fire lambda captures `this` in this .so, so a
     // tick still pending at unload is the IPC-dead-spin hazard.
     m_recaptureLeft = 0;
@@ -1024,7 +1473,7 @@ void Overview::hardClose() {
     restoreLayers(); // never leave a bar stuck at alpha 0 if we tear down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
     if (const auto ws = m_newWs.lock()) // don't leak a held-persistent "+"-created workspace
-        ws->setPersistent(false);
+        wsSetPersistent(ws, false);
     m_newWs.reset();
 
     m_active            = false;
@@ -1062,13 +1511,13 @@ bool Overview::showAllWorkspaces() const {
 // (per-frame add/remove detector) MUST agree, else syncTiles sees a phantom diff every frame
 // and reflow-churns.
 bool Overview::tileBelongs(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWORKSPACE& ws) const {
-    if (!w || !w->m_isMapped || w->isHidden())
+    if (!winMapped(w) || w->isHidden())
         return false;
     const auto wws = w->m_workspace;
     if (!wws)
         return false;
     if (showAllWorkspaces()) { // expo: every window living on this monitor, any workspace
-        if (wws->m_isSpecialWorkspace && cfgInt("plugin:gloview:show_special", 0) == 0)
+        if (wsIsSpecial(wws) && cfgInt("plugin:gloview:show_special", 0) == 0)
             return false;
         return wws->m_monitor.lock() == m;
     }
@@ -1125,9 +1574,9 @@ void Overview::buildTiles() {
             const auto w = t.win.lock();
             if (!w || !showWindowLabels())
                 continue;
-            std::string text = w->m_title;
+            std::string text = winTitle(w);
             if (text.empty())
-                text = w->m_class;
+                text = winAppId(w);
             if (text.size() > 80)
                 text = text.substr(0, 79) + "…";
             // Re-bake with maxWidth only when it overflows: a set Pango width right-aligns RTL
@@ -1171,24 +1620,24 @@ void Overview::buildStrip() {
         const auto ws = wref.lock();
         if (!ws || ws->m_monitor.lock() != m)
             continue;
-        if (ws->m_isSpecialWorkspace) {
+        if (wsIsSpecial(ws)) {
             if (showSpecial && wsHasWindows(ws)) // a scratchpad is only meaningful when populated
                 wss.push_back(ws);
             continue;
         }
-        if (ws->m_id <= 0)
+        if (!wsIsNumberedPositive(ws))
             continue;
         if (!showEmpty && ws != cur && !wsHasWindows(ws)) // hide empties (keep the displayed one)
             continue;
         wss.push_back(ws);
     }
 
-    if (cur && !cur->m_isSpecialWorkspace && cur->m_id > 0 && cur->m_monitor.lock() == m &&
+    if (wsIsNumberedPositive(cur) && cur->m_monitor.lock() == m &&
         std::none_of(wss.begin(), wss.end(), [&](const PHLWORKSPACE& ws) { return ws == cur; })) {
         wss.push_back(cur);
     }
 
-    std::sort(wss.begin(), wss.end(), [](const PHLWORKSPACE& a, const PHLWORKSPACE& b) { return a->m_id < b->m_id; });
+    std::sort(wss.begin(), wss.end(), [](const PHLWORKSPACE& a, const PHLWORKSPACE& b) { return wsNumericId(a) < wsNumericId(b); });
 
     // optional leading "All workspaces" card (toggles expo). Pushed FIRST so it sits at the
     // strip's leading edge; skipped wherever cards are treated as workspaces (see isAll guards).
@@ -1202,10 +1651,10 @@ void Overview::buildStrip() {
     for (const auto& ws : wss) {
         StripItem it;
         it.ws     = ws;
-        it.id     = ws->m_id;
+        it.id     = wsNumericId(ws);
         it.active = (ws == cur);
         for (const auto& w : Desktop::windowState()->windows()) {
-            if (!w || !w->m_isMapped || w->isHidden() || w->m_workspace != ws)
+            if (!winMapped(w) || w->isHidden() || w->m_workspace != ws)
                 continue;
             const auto p = w->positionAnimation()->goal();
             const auto s = w->sizeAnimation()->goal();
@@ -1227,7 +1676,7 @@ void Overview::buildStrip() {
     // one you were standing on looked duplicated. When the highest-id listed workspace is
     // already empty it IS the tail, so no create-on-use card is appended; putting a window on
     // it makes the next one appear (and emptying it again takes it back away).
-    const bool haveEmptyTail = dynamic && !wss.empty() && wss.back()->m_id > 0 && !wsHasWindows(wss.back());
+    const bool haveEmptyTail = dynamic && !wss.empty() && wsNumericId(wss.back()) > 0 && !wsHasWindows(wss.back());
     StripItem  plus;
     plus.isPlus = true;
     plus.isNew  = dynamic;
@@ -1238,7 +1687,7 @@ void Overview::buildStrip() {
         for (const auto& s : m_strip)
             if (!s.isAll && s.id >= tail)
                 tail = s.id + 1;
-        while (State::workspaceState()->query().id(tail).run())
+        while (wsQueryById(tail))
             ++tail;
         plus.id = tail;
     }
@@ -1253,7 +1702,7 @@ void Overview::buildStrip() {
         std::string text = "All workspaces";
         if (!it.isAll) {
             const auto ws = it.ws.lock();
-            std::string nm = ws ? ws->m_name : std::to_string(it.id);
+            std::string nm = ws ? wsDisplayName(ws) : std::to_string(it.id);
             const bool numeric = !nm.empty() && std::all_of(nm.begin(), nm.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
             text = numeric ? ("Workspace " + nm) : nm;
         }
@@ -1429,9 +1878,9 @@ void Overview::captureSnapshots() {
     // Only snapshot presentable windows: a window mid-move/resize can be transiently
     // unmapped/workspace-less, and makeSnapshot then null-derefs the surface → crash.
     const auto snap = [this](const PHLWINDOW& w) -> bool {
-        if (w && w->m_isMapped && w->m_workspace && !w->isHidden()) {
+        if (winMapped(w) && w->m_workspace && !w->isHidden()) {
             const auto     ws          = w->m_workspace;
-            const bool     wsVis       = ws->m_visible;
+            const bool     wsVis       = wsVisible(ws);
             const bool     wsForce     = ws->m_forceRendering;
             // Save BOTH value AND goal: setValueAndWarp(x) also sets goal:=x, so restoring
             // only value() pins a mid-animation workspace at a stale goal. That corruption
@@ -1444,7 +1893,7 @@ void Overview::captureSnapshots() {
             // m_forceRendering is THE flag makeSnapshot honours to paint a window on a
             // non-active workspace; without it the window renders empty → black/blank thumb.
             // Only WARP (never assign the goal), else the goal thrash corrupts the workspace.
-            ws->m_visible        = true;
+            wsSetVisible(ws, true);
             ws->m_forceRendering = true;
             ws->m_renderOffset->setValueAndWarp(Vector2D{});
             ws->m_alpha->setValueAndWarp(1.0F);
@@ -1463,7 +1912,7 @@ void Overview::captureSnapshots() {
                 m_snapFB[w.get()] = fb;
             m_captureWin.reset();
 
-            ws->m_visible        = wsVis;
+            wsSetVisible(ws, wsVis);
             ws->m_forceRendering = wsForce;
             // Warp back to the captured value, then re-aim at the original goal so an
             // in-flight slide resumes to its true destination (operator= no-ops if settled).
@@ -1795,11 +2244,15 @@ void Overview::renderStage(eRenderStage stage) {
     // this guard we'd re-add the overlay pass mid-snapshot → reentrant render → SEGV.
     if (m_capturing)
         return;
+
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
+
     const auto rm = g_pHyprRenderer->m_renderData.pMonitor.lock();
-    const auto m  = m_monitor.lock();
     // RENDER_LAST_MOMENT is after the top/overlay layers (bars), so the overview paints
     // over them instead of the bar bleeding on top.
-    if (!rm || !m || rm != m)
+    if (!rm || rm != m)
         return;
 
     if (stage != RENDER_LAST_MOMENT)
@@ -1814,6 +2267,8 @@ void Overview::renderStage(eRenderStage stage) {
 
     updateHover(); // keep hover fresh even when the pointer is warped, not moved
     syncTiles(); // window opened/closed/moved on this workspace → reflow the grid
+    // Path C: refresh noshare-cover extra rects to current tile layout (clear+add).
+    syncNoshareCoverExtraRects();
 
     // exit_on_switch: live workspace changed underneath us. switchToWorkspace only moves the
     // DISPLAYED workspace, so this fires only on genuine external switches.
@@ -1936,7 +2391,7 @@ void Overview::renderStrip() const {
             // card band over the blurred backdrop bleeds through.
             for (const auto& sw : it.wins) {
                 const auto w = sw.win.lock();
-                if (!w || !w->m_isMapped || w->isHidden())
+                if (!winMapped(w) || w->isHidden())
                     continue;
                 if (isFlying(w))
                     continue; // still arriving; renderFlyTile is drawing it
@@ -1995,7 +2450,7 @@ void Overview::renderStripWindows() const {
         card.y += slide.y + scroll.y;
         for (const auto& sw : it.wins) {
             const auto w = sw.win.lock();
-            if (!w || !w->m_isMapped || w->isHidden())
+            if (!winMapped(w) || w->isHidden())
                 continue;
             if (isFlying(w))
                 continue; // still arriving; renderFlyWindow is drawing it
@@ -2089,7 +2544,7 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
 
     const auto& t = m_tiles[i];
     const auto  w = t.win.lock();
-    if (!w || !w->m_isMapped || w->isHidden())
+    if (!winMapped(w) || w->isHidden())
         return;
 
     // Tile box fitted to the window's real aspect; live surface fills it at uniform scale so
@@ -2153,7 +2608,7 @@ void Overview::drawPreviewRing(size_t i, const LRect& slot, bool lift) const {
     if (!m || i >= m_tiles.size())
         return;
     const auto w = m_tiles[i].win.lock();
-    if (!w || !w->m_isMapped || w->isHidden())
+    if (!winMapped(w) || w->isHidden())
         return;
 
     const bool framed   = (static_cast<int>(i) == m_hovered || lift);
@@ -2255,7 +2710,7 @@ void Overview::renderMainWindows() const {
             if (static_cast<int>(i) == dragIdx || m_tiles[i].fades != fading)
                 continue;
             const auto w = m_tiles[i].win.lock();
-            if (!w || !w->m_isMapped || w->isHidden())
+            if (!winMapped(w) || w->isHidden())
                 continue;
             const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
             const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
@@ -2278,7 +2733,7 @@ void Overview::renderPrevPreviews() const {
 
     for (const auto& t : m_prevTiles) {
         const auto w = t.win.lock();
-        if (!w || !w->m_isMapped || w->isHidden())
+        if (!winMapped(w) || w->isHidden())
             continue;
         const LRect lb{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h};
         g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + 6.0, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(16.0 * s), shadowCol, e * 0.9);
@@ -2299,7 +2754,7 @@ void Overview::renderPrevWindows() const {
 
     for (const auto& t : m_prevTiles) {
         const auto w = t.win.lock();
-        if (!w || !w->m_isMapped || w->isHidden())
+        if (!winMapped(w) || w->isHidden())
             continue;
         const CBox px((t.target.x + off.x) * scale, (t.target.y + off.y) * scale, t.target.w * scale, t.target.h * scale);
         renderWindowLive(w, m, px, px, 1.0F, when, m_previewFilterGrid, round);
@@ -2322,7 +2777,7 @@ void Overview::renderFlyTile() const {
 
     for (const auto& f : m_flying) {
         const auto w = f.win.lock();
-        if (!w || !w->m_isMapped || w->isHidden())
+        if (!winMapped(w) || w->isHidden())
             continue;
         const LRect  lb    = flyBox(f);
         const double round = flyRound(lb);
@@ -2345,7 +2800,7 @@ void Overview::renderFlyWindow() const {
 
     for (const auto& f : m_flying) {
         const auto w = f.win.lock();
-        if (!w || !w->m_isMapped || w->isHidden())
+        if (!winMapped(w) || w->isHidden())
             continue;
         const LRect lb = flyBox(f);
         const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
@@ -2368,7 +2823,7 @@ void Overview::renderDragWindow() const {
     if (!m)
         return;
     const auto w = m_tiles[dragIdx].win.lock();
-    if (!w || !w->m_isMapped || w->isHidden())
+    if (!winMapped(w) || w->isHidden())
         return;
     const double e     = eased();
     const double scale = m->m_scale;
@@ -2415,7 +2870,7 @@ void Overview::renderAboveLayers() const {
     for (int idx : {2, 3}) {
         for (const auto& ref : m->m_layerSurfaceLayers[idx]) {
             const auto ls = ref.lock();
-            if (!ls || !ls->m_mapped || !ls->wlSurface() || !ls->wlSurface()->resource())
+            if (!layerMapped(ls) || !ls->wlSurface() || !ls->wlSurface()->resource())
                 continue;
             if (!isAboveLayer(ls->m_namespace))
                 continue;
@@ -2734,7 +3189,7 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LR
     PHLWORKSPACE target;
     if (it.isPlus) { // the "+" card, or dynamic_workspaces' trailing empty one
         const int id   = resolveNewId(it.id);
-        target         = State::workspaceState()->create(id, m->m_id);
+        target         = wsCreateNumbered(id, m);
         m_newCardId    = id; // pop the new card in
         m_newCardStart = std::chrono::steady_clock::now();
         m_newCardAnim  = true;
@@ -2833,7 +3288,7 @@ void Overview::switchToWorkspace(const StripItem& it) {
 
     PHLWORKSPACE ws;
     if (it.isPlus) {
-        ws = State::workspaceState()->create(resolveNewId(it.id), m->m_id, "", false);
+        ws = wsCreateNumbered(resolveNewId(it.id), m, "", false);
         if (!ws)
             return;
         // A brand-new empty workspace is reaped within a frame or two unless it is focused,
@@ -2841,8 +3296,8 @@ void Overview::switchToWorkspace(const StripItem& it) {
         // its tiles survive. deactivate() releases the hold; the previous held one is let go
         // here, which is what makes dynamic_workspaces' abandoned empties disappear again.
         if (const auto old = m_newWs.lock(); old && old != ws)
-            old->setPersistent(false);
-        ws->setPersistent(true);
+            wsSetPersistent(old, false);
+        wsSetPersistent(ws, true);
         m_newWs = ws;
     } else if (const auto target = it.ws.lock()) {
         ws = target;
@@ -2853,7 +3308,7 @@ void Overview::switchToWorkspace(const StripItem& it) {
 
     // Slide direction from strip order — the cards are sorted by id, so the ids decide it.
     // A freshly created workspace always takes the highest id, hence "forward".
-    beginWsSlide((!cur || ws->m_id >= cur->m_id) ? 1 : -1);
+    beginWsSlide((!cur || wsNumericId(ws) >= wsNumericId(cur)) ? 1 : -1);
 
     // Display the target inside the overview without changing the live desktop yet;
     // captureSnapshots() force-renders inactive workspaces without a real slide.
@@ -2865,7 +3320,7 @@ void Overview::switchToWorkspace(const StripItem& it) {
     // user asked for that workspace, so it stays until close.
     if (dynamicWorkspaces()) {
         if (const auto held = m_newWs.lock(); held && held != ws && !workspaceOccupied(held)) {
-            held->setPersistent(false);
+            wsSetPersistent(held, false);
             m_newWs.reset();
         }
     }
@@ -2953,7 +3408,7 @@ std::vector<PHLWORKSPACE> Overview::liveWorkspaceList(const PHLMONITOR& m) const
 
     for (const auto& wref : State::workspaceState()->workspaces()) {
         const auto ws = wref.lock();
-        if (!ws || ws->m_isSpecialWorkspace || ws->m_id <= 0) // scratchpads and named (-1337…) aren't stepped through
+        if (!ws || !wsIsNumberedPositive(ws)) // scratchpads and named (-1337…) aren't stepped through
             continue;
         if (ws->m_monitor.lock() != m)
             continue;
@@ -2961,10 +3416,10 @@ std::vector<PHLWORKSPACE> Overview::liveWorkspaceList(const PHLMONITOR& m) const
             continue;
         wss.push_back(ws);
     }
-    if (cur && cur->m_id > 0 && !cur->m_isSpecialWorkspace && std::none_of(wss.begin(), wss.end(), [&](const PHLWORKSPACE& ws) { return ws == cur; }))
+    if (wsIsNumberedPositive(cur) && std::none_of(wss.begin(), wss.end(), [&](const PHLWORKSPACE& ws) { return ws == cur; }))
         wss.push_back(cur);
 
-    std::sort(wss.begin(), wss.end(), [](const PHLWORKSPACE& a, const PHLWORKSPACE& b) { return a->m_id < b->m_id; });
+    std::sort(wss.begin(), wss.end(), [](const PHLWORKSPACE& a, const PHLWORKSPACE& b) { return wsNumericId(a) < wsNumericId(b); });
     return wss;
 }
 
@@ -3018,11 +3473,11 @@ bool Overview::stepLiveWorkspace(int dir) {
     // …the create-on-use tail: take the id right after the last one, like buildStrip.
     int id = 1;
     for (const auto& ws : wss)
-        if (ws->m_id >= id)
-            id = ws->m_id + 1;
-    while (State::workspaceState()->query().id(id).run())
+        if (wsNumericId(ws) >= id)
+            id = wsNumericId(ws) + 1;
+    while (wsQueryById(id))
         ++id;
-    const auto fresh = State::workspaceState()->create(id, m->m_id, "", false);
+    const auto fresh = wsCreateNumbered(id, m, "", false);
     if (!fresh)
         return false;
     // No persistence pin needed here (unlike the overview's held tail): changeWorkspace makes
@@ -3043,7 +3498,7 @@ bool Overview::setWorkspace(int id) {
         const auto m = activeMonitor();
         if (!m)
             return false;
-        const auto ws = State::workspaceState()->query().id(id).run();
+        const auto ws = wsQueryById(id);
         if (!ws || ws->m_monitor.lock() != m)
             return false;
         if (ws != m->m_activeWorkspace)
@@ -3063,7 +3518,7 @@ bool Overview::setWorkspace(int id) {
     const auto m = m_monitor.lock();
     if (!m)
         return false;
-    const auto ws = State::workspaceState()->query().id(id).run();
+    const auto ws = wsQueryById(id);
     if (!ws || ws->m_monitor.lock() != m)
         return false;
     StripItem it;
@@ -3079,13 +3534,13 @@ namespace {
 uint32_t modBitForKeycode(int kc) {
     switch (kc) {
         case 42:
-        case 54: return HL_MODIFIER_SHIFT;
+        case 54: return MOD_SHIFT;
         case 29:
-        case 97: return HL_MODIFIER_CTRL;
+        case 97: return MOD_CTRL;
         case 56:
-        case 100: return HL_MODIFIER_ALT;
+        case 100: return MOD_ALT;
         case 125:
-        case 126: return HL_MODIFIER_META;
+        case 126: return MOD_META;
         default: return 0;
     }
 }
@@ -3112,7 +3567,7 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
     // Held modifiers across all keyboards (not just keys pressed since the overview
     // opened), minus the pressed key's OWN modifier bit — else a bare modifier name
     // ("shift", the key_desktop default) could never match its own press.
-    uint32_t mods = g_pInputManager ? g_pInputManager->getModsFromAllKBs() : 0;
+    uint32_t mods = g_pInputManager ? static_cast<uint32_t>(g_pInputManager->getModsFromAllKBs()) : 0;
     mods &= ~modBitForKeycode(k);
     bool handled = true;
     if (keyMatches(k, mods, "plugin:gloview:key_close", "escape"))
@@ -3216,13 +3671,13 @@ uint32_t modNameToBit(std::string t) {
     for (auto& c : t)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (t == "shift")
-        return HL_MODIFIER_SHIFT;
+        return MOD_SHIFT;
     if (t == "ctrl" || t == "control")
-        return HL_MODIFIER_CTRL;
+        return MOD_CTRL;
     if (t == "alt")
-        return HL_MODIFIER_ALT;
+        return MOD_ALT;
     if (t == "super" || t == "meta" || t == "win")
-        return HL_MODIFIER_META;
+        return MOD_META;
     return 0;
 }
 
@@ -3233,7 +3688,7 @@ uint32_t modNameToBit(std::string t) {
 // through to Hyprland's keybind manager, so the same bind that opened the overview
 // closes it). Only lock states (caps/num) are ignored.
 bool comboMatches(int keycode, uint32_t heldMods, std::string token) {
-    constexpr uint32_t STRICTMODS = HL_MODIFIER_SHIFT | HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_META;
+    constexpr uint32_t STRICTMODS = MOD_STRICT;
 
     uint32_t           need = 0;
     size_t             pos;
@@ -3342,7 +3797,7 @@ void Overview::activateWindow(const PHLWINDOW& w, bool keybind) {
         const auto ws = w->m_workspace;
         // Special (scratchpad) workspaces are not something changeWorkspace should land on —
         // focusing the window is enough; Hyprland keeps the scratchpad up on its own.
-        if (m && ws && !ws->m_isSpecialWorkspace && ws->m_monitor.lock() == m)
+        if (m && ws && !wsIsSpecial(ws) && ws->m_monitor.lock() == m)
             m_workspace = ws;
     }
     close();
@@ -3364,7 +3819,7 @@ void Overview::syncFocus() const {
         return;
     const auto m = m_monitor.lock();
     const auto w = m_tiles[m_selected].win.lock();
-    if (!m || !w || !w->m_isMapped || w->isHidden())
+    if (!m || !winMapped(w) || w->isHidden())
         return;
     if (w->m_workspace != m->m_activeWorkspace) // displaying a non-live workspace — don't desync
         return;
@@ -3563,7 +4018,7 @@ void Overview::addWorkspace(int id_) {
     if (!m)
         return;
     const int  id = resolveNewId(id_);
-    const auto ws = State::workspaceState()->create(id, m->m_id, "", false);
+    const auto ws = wsCreateNumbered(id, m, "", false);
     if (!ws)
         return;
     // A new empty workspace is reaped within a frame or two unless focused. Hold it
@@ -3571,8 +4026,8 @@ void Overview::addWorkspace(int id_) {
     // applies after). Releasing the previously held one is what lets an abandoned empty
     // workspace disappear again under dynamic_workspaces.
     if (const auto old = m_newWs.lock(); old && old != ws)
-        old->setPersistent(false);
-    ws->setPersistent(true);
+        wsSetPersistent(old, false);
+    wsSetPersistent(ws, true);
     m_newWs        = ws;
     m_newCardId    = id;
     m_newCardStart = std::chrono::steady_clock::now();
@@ -3599,7 +4054,7 @@ void Overview::closeWorkspaceWindows(const StripItem& it) {
         return;
     int n = 0;
     for (const auto& w : Desktop::windowState()->windows())
-        if (w && w->m_isMapped && !w->isHidden() && w->m_workspace == ws) {
+        if (winMapped(w) && !w->isHidden() && w->m_workspace == ws) {
             w->sendClose();
             ++n;
         }
@@ -3651,6 +4106,7 @@ bool Overview::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& mon) const
 }
 
 void Overview::deactivate() {
+    noshare_cover::clearExtraRects(); // drop share tile covers when overview goes idle
     restoreLayers(); // safety net: normally close() already restored; harmless if empty
     restoreFill();   // drop the fill-small override so real windows render normally again
     m_canvasPos.clear();
@@ -3663,7 +4119,7 @@ void Overview::deactivate() {
     // Drop the hold on a "+"-created workspace: it stays if active or a window landed
     // there, otherwise reaps like any empty one.
     if (const auto ws = m_newWs.lock())
-        ws->setPersistent(false);
+        wsSetPersistent(ws, false);
     m_newWs.reset();
 
     m_active  = false;

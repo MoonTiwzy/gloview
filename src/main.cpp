@@ -8,6 +8,7 @@
 #include <hyprland/src/config/values/types/FloatValue.hpp>
 #include <hyprland/src/config/values/types/StringValue.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include "hypr_compat.hpp"
 
 extern "C" {
 #include <lauxlib.h>
@@ -234,6 +235,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:close_button_color", Config::INTEGER{0xe6e23b3bLL}); // desktop-mode "✕" close button fill
 
     // --- bar / layer-shell hiding (waybar, quickshell-based bars, …) ---
+    // no_screen_share: honor Hyprland noscreenshare on overview *preview tiles* in share
+    // (per-tile black). Dual-view via ScreenshareFrame::renderMonitor when free, or via
+    // noshare-cover extra-rect API (Path C). Old cover without API → Option B while sharing.
+    // Default 1.
+    addInt("plugin:gloview:no_screen_share", Config::INTEGER{1});
+    // Prefer noshare-cover coexistence: Path C (extra-rect API) or Path B (Option B) when
+    // cover is loaded — skip fighting for ScreenshareFrame::renderMonitor. Set 0 to always
+    // attempt Path A even if cover is detected. Default 1.
+    addInt("plugin:gloview:noshare_cover_compat", Config::INTEGER{1});
+
     addInt("plugin:gloview:hide_top_layers", Config::INTEGER{0});     // fade out Top layer surfaces (bars) while the overview is up
     addInt("plugin:gloview:hide_overlay_layers", Config::INTEGER{0}); // fade out Overlay layer surfaces (popups/notifications)
     addStr("plugin:gloview:above_namespaces", "");                    // comma/space list of layer namespaces to draw ABOVE the overview (supports trailing '*' glob); namespaces containing "aboveoverview" are always treated this way
@@ -264,87 +275,48 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(handle, "gloview:prev", dispPrev);
     HyprlandAPI::addDispatcherV2(handle, "gloview:setworkspace", dispSetWorkspace);
 
-    // hyprctl command (exact, not lua-evaluated) — reliable invoke path:  hyprctl gloview
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloview",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggle();
-                                                        return "ok\n";
-                                                    },
-                                                });
-
+    // hyprctl commands (exact, not lua-evaluated) — reliable invoke path: hyprctl <name>
+    // registerExactHyprCtl picks Socket1::SCommand (83cf6a6+) or SHyprCtlCommand (0.56.2).
+    gloview::registerExactHyprCtl(handle, "gloview", [] {
+        if (g_overview)
+            g_overview->toggle();
+    });
     // close-only (no-op if not open): dismiss the overlay before unloading.
     // Unloading mid-render with the overview up tears down the render hooks while
     // an in-flight frame still references them → Hyprland crash.
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewclose",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->close();
-                                                        return "ok\n";
-                                                    },
-                                                });
-
+    gloview::registerExactHyprCtl(handle, "gloviewclose", [] {
+        if (g_overview)
+            g_overview->close();
+    });
     // UNLOAD-safe teardown:  hyprctl gloviewunload  — run by the `reload` target
     // before `plugin unload`. Unlike gloviewclose (which only *starts* the close
     // animation), this drops all overlay state + the recapture timer synchronously,
     // so the next frame renders with no plugin-owned pass elements and dlclose can't
     // free a callback that is still referenced mid-frame. Makes reload deterministic.
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewunload",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->hardClose();
-                                                        return "ok\n";
-                                                    },
-                                                });
-
+    gloview::registerExactHyprCtl(handle, "gloviewunload", [] {
+        if (g_overview)
+            g_overview->hardClose();
+    });
     // free-arrange desktop mode toggle:  hyprctl gloviewdesktop
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewdesktop",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggleDesktop();
-                                                        return "ok\n";
-                                                    },
-                                                });
-
+    gloview::registerExactHyprCtl(handle, "gloviewdesktop", [] {
+        if (g_overview)
+            g_overview->toggleDesktop();
+    });
     // all-workspaces (expo) view toggle:  hyprctl gloviewall — opens into expo if closed
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewall",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggleAllWorkspaces();
-                                                        return "ok\n";
-                                                    },
-                                                });
-
+    gloview::registerExactHyprCtl(handle, "gloviewall", [] {
+        if (g_overview)
+            g_overview->toggleAllWorkspaces();
+    });
     // step the displayed workspace:  hyprctl gloviewnext / gloviewprev
     // (setworkspace takes an argument, so it is dispatcher-only: hyprctl dispatch gloview:setworkspace 2)
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewnext",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->nextWorkspace();
-                                                        return "ok\n";
-                                                    },
-                                                });
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewprev",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->prevWorkspace();
-                                                        return "ok\n";
-                                                    },
-                                                });
+    gloview::registerExactHyprCtl(handle, "gloviewnext", [] {
+        if (g_overview)
+            g_overview->nextWorkspace();
+    });
+    gloview::registerExactHyprCtl(handle, "gloviewprev", [] {
+        if (g_overview)
+            g_overview->prevWorkspace();
+    });
 
     const bool isLua = Config::mgr() && Config::mgr()->type() == Config::CONFIG_LUA;
     bool       luaOk = false;

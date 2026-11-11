@@ -7,12 +7,37 @@ A better macOS Mission Control-style overview plugin for Hyprland
 
 ## Install
 
-Via hyprpm:
+### Dual Hyprland ABI
+
+One codebase builds against both:
+
+| Target | Hyprland | Typical use |
+|---|---|---|
+| **Legacy** | **v0.56.2** | Arch `hyprpm`, upstream-style pins |
+| **New** | **83cf6a6…** (`83cf6a6ed540dc37808434259c6a3ba663de9616`) | nixoser / post–workspace-window-IPC refactor |
+
+Compile-time detection lives in `src/hypr_compat.hpp` (`__has_include` on
+`desktop/view/window/Window.hpp` and `ipc/s1/S1.hpp`). Wrappers cover workspace
+create/query, window mapped/title/appid/presentation, modifiers, hyprctl IPC, and
+noscreenshare accessors. The flake exposes a single `gloview` package; the
+`hyprland` input decides which ABI you link against.
+
+### Via hyprpm (Arch / system Hyprland)
+
+Rebuild against **your installed Hyprland headers** so the `.so` matches the
+running compositor (0.56.2 on current Arch packages):
 
 ```sh
-hyprpm add https://github.com/fedsfarm/gloview
+# this fork (dual ABI) — or upstream fedsfarm/gloview on stock 0.56.2 only
+hyprpm add https://github.com/MoonTiwzy/gloview
+hyprpm update
 hyprpm enable gloview
 ```
+
+If enable fails with missing headers such as `ipc/s1/S1.hpp` or
+`desktop/view/window/Window.hpp`, you were on a new-only tree against old
+headers — pull latest `main` (this dual-ABI tree) and `hyprpm update` again.
+`hyprpm` compiles with the system Hyprland pkg-config; no flake override needed.
 
 ### Arch (AUR)
 
@@ -20,11 +45,21 @@ hyprpm enable gloview
 yay -S gloview
 ```
 
-### Nixos
+### NixOS / Home Manager
+
+**Always** make the plugin follow your compositor's Hyprland input so the ABI
+matches (`follows` is the switch between 0.56.2 and 83cf6a6):
 
 ```nix
-inputs.gloview = { url = "github:fedsfarm/gloview"; inputs.hyprland.follows = "hyprland"; };
+inputs.gloview.url = "github:MoonTiwzy/gloview";
+# Required: same Hyprland derivation as the running compositor
+inputs.gloview.inputs.hyprland.follows = "hyprland";
 ```
+
+With `follows`, the flake passes that Hyprland derivation through unchanged. Updating
+`gloview` and switching Home Manager therefore builds only the plugin `.so`; it does
+not create or rebuild a second Hyprland derivation.
+
 ```nix
 wayland.windowManager.hyprland = {
   enable = true;
@@ -32,6 +67,20 @@ wayland.windowManager.hyprland = {
   settings.bind = [ "SUPER, TAB, gloview:toggle" ];
 };
 ```
+
+Flake default pin is `83cf6a6…`. To build explicitly against either side:
+
+```sh
+# new (default lock / nixoser)
+nix build .#gloview -L
+
+# legacy v0.56.2 (Arch-typical)
+nix build .#gloview --override-input hyprland github:hyprwm/Hyprland/v0.56.2 -L
+```
+
+Or set `inputs.hyprland.url` in a consumer flake to
+`github:hyprwm/Hyprland?ref=v0.56.2` or
+`github:hyprwm/Hyprland?rev=83cf6a6ed540dc37808434259c6a3ba663de9616`.
 
 ## Manual build
 
@@ -154,6 +203,8 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `switch_on_drop` | bool (0/1) | `0` | Dropping a window on a card also follows it to that workspace |
 | `switch_on_new_workspace` | bool (0/1) | `1` | Clicking `+` follows the display to the new workspace |
 | `close_button_color` | color | `0xe6e23b3b` | Desktop-mode `✕` close-button fill |
+| `no_screen_share` | bool (0/1) | `1` | Honor Hyprland `noscreenshare` / `no_screen_share` on overview **preview tiles** in share: black those boxes only; other tiles + chrome stay visible. Dual-view (local live) via Path A (`ScreenshareFrame::renderMonitor`) or Path C (noshare-cover extra-rect API); old cover without API → Option B (local black while shared). Not mirror-FB clears |
+| `noshare_cover_compat` | bool (0/1) | `1` | Detect [noshare-cover](https://github.com/MoonTiwzy/noshare-cover) and prefer Path C / Path B over fighting for `ScreenshareFrame::renderMonitor`. Set `0` to always attempt dual-view Path A even if cover is loaded. See *Screen share + noshare-cover* below |
 | `hide_top_layers` | bool (0/1) | `0` | Fade out Top layer surfaces (bars, e.g. Waybar) while open |
 | `hide_overlay_layers` | bool (0/1) | `0` | Fade out Overlay layer surfaces (popups/notifications) while open |
 | `above_namespaces` | string | `""` | Comma/space list of layer namespaces to draw *above* the overview (trailing `*` glob; a namespace containing `aboveoverview` always qualifies) |
@@ -222,7 +273,9 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 switch_on_drop          = 0,
                 switch_on_new_workspace = 1,
 
-                hide_top_layers     = 0,
+                no_screen_share       = 1,  -- black noscreenshare preview tiles in share (Path A/C dual-view)
+                noshare_cover_compat  = 1,  -- Path C (noshare-cover API) when noshare-cover is loaded
+                hide_top_layers       = 0,
                 hide_overlay_layers = 0,
                 above_namespaces    = "",
                 debug_logs = 0,
@@ -354,3 +407,58 @@ AI code is allowed if it's submitted and tested by a human
 ---
 
 Email [root@feds.farm](mailto:root@feds.farm) or DM [@root:feds.farm](https://escape.feds.farm/#@root:feds.farm) on Matrix if you want your donation to be visible
+
+## Screen share + noshare-cover
+
+[noshare-cover](https://github.com/MoonTiwzy/noshare-cover) replaces Hyprland's
+`no_screen_share` black boxes with an image/video on the **share** path. It hooks
+`ScreenshareFrame::renderMonitor` (Hyprland's function trampoline is exclusive, two
+plugins cannot both own that hook) and paints covers on real window boxes. It also
+exports a C API so other plugins can add rectangles of their own, here the overview
+tile boxes. gloview uses API v2 when available (`include/noshare_cover_api.h` in
+noshare-cover):
+
+- one client per plugin (`register_client("gloview")`), its rects replaced atomically
+  per monitor with `set_rects`;
+- each rect carries the window address and `FILL_WINDOW`, so a preview tile shows the
+  **same cover as the window itself** in the capture, not a black box;
+- a *gone* callback fired from noshare-cover's `PLUGIN_EXIT` after it released
+  `renderMonitor`.
+
+With the callback armed gloview drops its `RTLD_NOLOAD` handle right after binding.
+Holding it would keep noshare-cover mapped after unload, and a same-path reload would
+then silently get the old image. Older noshare-cover builds without v2 still work
+through the v1 functions (`noshare_cover_clear_extra_rects` /
+`noshare_cover_add_extra_rect`, black boxes).
+
+**RTLD_LOCAL caveat:** Hyprland loads plugins with `RTLD_LOCAL`, so
+`dlsym(RTLD_DEFAULT, ...)` will **not** see those symbols. gloview resolves the mapped
+`.so` via `dl_iterate_phdr` (needle `noshare-cover` / `libnoshare-cover.so`), then
+`dlopen(path, RTLD_LAZY | RTLD_NOLOAD)` + `dlsym`. See `src/noshare_cover_compat.hpp`.
+
+gloview (`plugin:gloview:noshare_cover_compat`, default **1**) picks one of:
+
+1. **Path C** (cover loaded + API bound): never fights for `renderMonitor`. Each overview
+   frame sends every noscreenshare preview tile (main grid, strip cards, drag/fly/slide).
+   **Dual-view:** local overview keeps live tiles; the share shows the covers.
+2. **Path B** (cover loaded, no API at all, very old cover): leave `renderMonitor` alone;
+   while `isOutputBeingSSd`, overview draws solid black for ruled tiles in the normal
+   pass so the mirror carries black. **Local tradeoff:** those tiles are also black on
+   the interactive overview while that output is shared.
+3. **Path A** (cover not loaded, or compat off): gloview hooks `renderMonitor` for
+   dual-view when the trampoline is free.
+
+**Load order does not matter.** Hyprland reloads the config after every plugin
+load/unload; gloview re-picks the path then (and on the gone callback). If gloview owns
+`renderMonitor` when noshare-cover appears, it lets go and noshare-cover (which retries
+its hook) takes over; when noshare-cover is unloaded gloview takes it back.
+
+Set `noshare_cover_compat = 0` only if you intentionally want gloview to fight for
+Path A (hook may still fail silently → Path B). Soft failures never ABRT or orange-notify.
+
+## TODO / known limitations
+
+- **Screen-share tile blackout** (`plugin:gloview:no_screen_share`, default 1): Path A/C
+  dual-view or Path B fallback — see *Screen share + noshare-cover* above. Not full-buffer
+  clear / mirror-FB / RENDER_POST EGL.
+

@@ -1,6 +1,8 @@
 #include "preview_filter.hpp"
+#include "hypr_compat.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <utility>
 
 #include <hyprland/src/config/ConfigValue.hpp>
@@ -11,6 +13,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/helpers/math/Math.hpp>
 
 using Render::GL::g_pHyprOpenGL;
 
@@ -205,13 +208,18 @@ bool drawSurface(const SurfaceData& data) {
                                        (surface ? surface->m_alphaModifier * surface->m_overallOpacity : 1.0F),
                                    0.0F, 1.0F);
 
+#if GLOVIEW_HYPR_ABI_NEW
+    // Match Hyprland renderTextureInternal @ 83cf6a6: inverse of wl_surface buffer transform.
+    // Rotated textures swap footprint X/Y — fall back to the stock pass.
+    const auto transform = Math::invertTransform(texture->m_transform);
+#else
+    // 0.56.2: compose monitor transform when monitorTransformEnabled().
     auto transform = texture->m_transform;
     if (g_pHyprRenderer->monitorTransformEnabled()) {
         const auto monitorTransform = Math::wlTransformToHyprutils(Math::invertTransform(fallback.pMonitor->m_transform));
         transform = Math::composeTransform(monitorTransform, transform);
     }
-    // The filter footprint is expressed in destination X/Y. Rotated textures swap those
-    // axes, so leave them to Hyprland's normal surface renderer.
+#endif
     if (swapsAxes(transform))
         return false;
 
@@ -252,8 +260,17 @@ bool drawSurface(const SurfaceData& data) {
 
     if (!g_pHyprRenderer->m_bBlockSurfaceFeedback)
         fallback.surface->presentFeedback(fallback.when, fallback.pMonitor->m_self.lock());
+#if GLOVIEW_HYPR_ABI_NEW
+    // Async buffers live on the monitor (ElementRenderer::preDrawSurface @ 83cf6a6).
+    if (fallback.surface->m_current.buffer && !fallback.surface->m_current.buffer->isSynchronous() &&
+        std::ranges::none_of(fallback.pMonitor->m_usedAsyncBuffers,
+                             [&](const auto& e) { return e.first == fallback.surface && e.second == fallback.surface->m_current.buffer; }))
+        fallback.pMonitor->m_usedAsyncBuffers.emplace_back(fallback.surface, fallback.surface->m_current.buffer);
+#else
+    // 0.56.2: async buffers tracked on the renderer.
     if (fallback.surface->m_current.buffer && !fallback.surface->m_current.buffer->isSynchronous())
         g_pHyprRenderer->m_usedAsyncBuffers.emplace_back(fallback.surface->m_current.buffer);
+#endif
     return true;
 }
 
